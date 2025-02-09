@@ -1,7 +1,10 @@
 # self_fix_model
 try1 是 初步的想法，目的是通过logits判断内容自信程度并生成合适的prompt
+
 try2 为了保证训练方便更改了promt的生成为带有梯度的fussion来拼接输入，其中trian_decoder是主模型的训练方式
+
 虽然最后结果没有那么好，但可以为诸位提供一种思路
+
 想法摘要：
 
       在transformer基础架构上，取transformer最后的logits与hidden_states，两者拼接形成修正矩阵，将修正矩阵与output放入fusion融合，再将其输出调入transformer主架构。
