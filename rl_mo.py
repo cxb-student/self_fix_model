@@ -83,19 +83,24 @@ class OptimizedDecoder(nn.Module):
 
 # 自定义数据集
 class QADataset(Dataset):
-    def __init__(self, data, tokenizer, max_length=512, max_answer_length=512):
+    def __init__(self, data, q,a,tokenizer, max_length=512, max_answer_length=512):
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_answer_length = max_answer_length
+        self.q = q
+        self.a = a
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         sample = self.data[idx]
-        question = sample["question"]
-        answer = sample["answer"]
+        print(sample)
+        print(self.q)
+        print(self.a)
+        question = sample[self.q]
+        answer = sample[self.a]
         question_enc = self.tokenizer(
             question,
             max_length=self.max_length,
@@ -132,21 +137,29 @@ class ContrastiveLoss(nn.Module):
 
 # 奖励函数类
 class RewardFunction:
-    def __init__(self, threshold=0.7, confidence_penalty=0.2):
+    def __init__(self, threshold=0.7, confidence_penalty=0.2, confidence_threshold=0.8):
         self.threshold = threshold
         self.confidence_penalty = confidence_penalty
+        self.confidence_threshold = confidence_threshold  # Confidence threshold to differentiate between high and low confidence
 
     def get_reward(self, generated_text, real_answer, logits, labels):
         similarity = self.jaccard_similarity(generated_text, real_answer)
-        if similarity > 0.9:
-            reward = 1.0
-        elif similarity > 0.7:
-            reward = 0.5
-        else:
-            reward = -0.5
+
+        # Step 1: Calculate the confidence score
         confidence = self.calculate_confidence(logits, labels)
-        if confidence < self.confidence_penalty:
-            reward *= 0.5
+
+        # Step 2: Determine reward based on similarity and confidence
+        if similarity > 0.9:
+            if confidence >= self.confidence_threshold:
+                reward = 1.0  # Correct and confident
+            else:
+                reward = 0.5  # Correct but not confident
+        else:
+            if confidence >= self.confidence_threshold:
+                reward = -0.5  # Incorrect but confident
+            else:
+                reward = 0.7  # Incorrect and not confident
+
         return reward
 
     def calculate_confidence(self, logits, labels):
@@ -161,7 +174,6 @@ class RewardFunction:
         return intersection / union if union else 0
 
 
-# 强化学习损失
 class ReinforceLoss(nn.Module):
     def forward(self, logits, labels, rewards):
         log_probs = F.log_softmax(logits, dim=-1)
@@ -246,14 +258,65 @@ class SelfFixModel(nn.Module):
         else:
             return final_answer, loss
 
+class CombinedQADataset(Dataset):
+    def __init__(self, dataset1, dataset2):
+        """
+        :param dataset1: 第一个 QADataset (可以是 question-answer 数据集)
+        :param dataset2: 第二个 QADataset (可以是 problem-rationale 数据集)
+        """
+        self.dataset1 = dataset1
+        self.dataset2 = dataset2
 
+        # 标记数据集类型，保留数据源
+        self.dataset1_len = len(dataset1)
+        self.dataset2_len = len(dataset2)
+    def __len__(self):
+        return self.dataset1_len + self.dataset2_len
+
+    def __getitem__(self, idx):
+        if idx < self.dataset1_len:
+            return self.dataset1[idx]  # 从 dataset1 中获取数据
+        else:
+            return self.dataset2[idx - self.dataset1_len]  # 从 dataset2 中获取数据
 # 评估函数
-def evaluate(model, tokenizer, dataloader, device):
+def evaluate(model, tokenizer, dataloader, device, confidence_threshold=0.8):
     model.eval()
     total_correct = 0
     total_samples = 0
     bleu_scores = []
     jaccard_scores = []
+    uncertain_phrases = ["不确定", "我不知道", "无法回答", "不清楚",
+    "I'm not sure",
+    "I don't know",
+    "I'm not certain",
+    "It's unclear",
+    "I can't say for sure",
+    "I'm unsure",
+    "It's difficult to say",
+    "I have no idea",
+    "I don't have enough information",
+    "I can't be sure",
+    "It's hard to say",
+    "I’m uncertain",
+    "I’m not positive",
+    "I’m not entirely sure",
+    "I’m not convinced",
+    "I can't say for certain",
+    "It could be",
+    "I think maybe",
+    "It's possible",
+    "Perhaps",
+    "Maybe",
+    "Not sure",
+    "I wonder if",
+    "I'm still figuring it out",
+    "Could be",
+    "It's anyone's guess",
+    "It's not clear",
+    "I’m guessing",
+    "There’s a chance",
+    "I’m doubtful","It’s up in the air","I’m not 100% sure","I might be wrong","I’m leaning towards","It seems like","It’s hard to say for certain","I'm still unsure", "I'm on the fence","It’s kind of unclear","Not entirely sure","It’s open to interpretation","I can't confirm","I’m still thinking about it"
+]  # 定义不确定的关键词
 
     with torch.no_grad():
         for batch in dataloader:
@@ -264,15 +327,32 @@ def evaluate(model, tokenizer, dataloader, device):
             predicted_answers, _ = model(input_ids=input_ids, answer_ids=answer_ids)
 
             for pred, real in zip(predicted_answers, real_answers):
-                pred_num = extract_number(pred)
-                real_num = extract_number(real)
+                # 使用检测句子边界的函数来分割生成文本
+                boundaries = detect_sentence_boundaries(pred, tokenizer)
+                last_three_sentences = []
 
-                if pred_num and real_num and pred_num == real_num:
+                # 获取最后三句
+                for (start, end) in boundaries[-3:]:  # 取最后三句
+                    last_three_sentences.append(pred[start:end].strip())
+
+                # 检查最后三句是否包含不确定的表述
+                uncertain_in_last_three = any(
+                    any(phrase in sentence for phrase in uncertain_phrases) for sentence in last_three_sentences
+                )
+
+                if uncertain_in_last_three:
                     total_correct += 1
-                elif not pred_num or not real_num:
-                    similarity = jaccard_similarity(pred, real)
-                    if similarity > 0.7:
+                else:
+                    # 普通情况：只要答案匹配且符合置信度要求，则认为正确
+                    pred_num = extract_number(pred)
+                    real_num = extract_number(real)
+
+                    if pred_num and real_num and pred_num == real_num:
                         total_correct += 1
+                    elif not pred_num or not real_num:
+                        similarity = jaccard_similarity(pred, real)
+                        if similarity > 0.7:
+                            total_correct += 1
 
                 bleu = sentence_bleu([real.split()], pred.split())
                 bleu_scores.append(bleu)
@@ -318,43 +398,26 @@ def train(model, tokenizer, train_dataloader, test_dataloader, device, num_epoch
         evaluate(model, tokenizer, test_dataloader, device)
         print(f"Epoch {epoch + 1} - Loss: {total_loss:.4f}")
         torch.save(model.state_dict(), f"{save_path}_epoch_{epoch + 1}.pth")
-
     print("训练完成！")
-
-
-# 主函数
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = "Qwen/Qwen2-VL-7B-Instruct"
-
+    model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     # 加载数据集
-    dataset1 = load_dataset("gsm8k", split="train")
+    dataset1 = load_dataset("gsm8k", "main", split="train")
     dataset2 = load_dataset("math_qa", split="train")
-    dataset3 = load_dataset("grade_school_math_instructions", split="train")
-
-    # 合并数据集
-    combined_dataset = []
-    combined_dataset.extend(dataset1)
-    combined_dataset.extend(dataset2)
-    combined_dataset.extend(dataset3)
-
-    # 初始化数据集
+    dataset3 = load_dataset("gsm8k", "main", split="test")
+    print(dataset1[0])
+    print(dataset2[0])
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
-
-    train_dataset = QADataset(combined_dataset, tokenizer)
-    test_dataset = QADataset(dataset1, tokenizer)
-
+    train_dataset1 = QADataset(dataset1,'question','answer', tokenizer)
+    train_dataset2 = QADataset(dataset2,'Problem','Rationale', tokenizer)
+    train_dataset = CombinedQADataset(train_dataset1, train_dataset2)
+    test_dataset = QADataset(dataset3,'question','answer', tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=4)
-
-    # 初始化模型
     model = SelfFixModel(model_name=model_path)
     model.to(device)
-
-    # 训练
     train(model, tokenizer, train_dataloader, test_dataloader, device)
-
-
 if __name__ == "__main__":
     main()
